@@ -39,7 +39,7 @@ use simwood_rs::{ApiNoContext, ContextWrapperExt,
                      };
 
 use kube::{
-    api::{Object, RawApi, Reflector, Void},
+    api::{Informer, Object, RawApi, Void, WatchEvent},
     client::APIClient,
     config,
 };
@@ -74,7 +74,6 @@ type PstnConnection = Object<PstnConnectionSpec, Void>;
 
 fn main() -> Result<(), failure::Error> {
 
-    std::env::set_var("RUST_LOG", "info,kube=trace");
     env_logger::init();
     
     let config = config::load_kube_config().expect("failed to load kubeconfig");
@@ -86,16 +85,24 @@ fn main() -> Result<(), failure::Error> {
         .group("alpha.matt-williams.github.io")
         .within(&namespace);
 
-    let rf : Reflector<PstnConnection> = Reflector::raw(client, resource).init()?;
-
+    let informer : Informer<PstnConnection> = Informer::raw(client, resource).init()?;
     loop {
-        // Update internal state by calling watch (blocks):
-        rf.poll()?;
+        informer.poll()?;
 
-        // Read updated internal state (instant):
-        rf.read()?.into_iter().for_each(|crd| {
-            info!("pstn-connection {}: {}", crd.metadata.name, crd.spec.provider.simwood.account);
-        });
+        while let Some(event) = informer.pop() {
+            match event {
+                WatchEvent::Added(pstn) => {
+                    println!("Added PSTN connection {} for account {}", pstn.metadata.name, pstn.spec.provider.simwood.account);
+                },
+                WatchEvent::Deleted(pstn) => {
+                    println!("Deleted PSTN connection {} for account {}", pstn.metadata.name, pstn.spec.provider.simwood.account);
+                },
+                event => {
+                    println!("Another event occurred: {:?}", event);
+                }
+
+            }
+        }
     }
 
     let mut core = reactor::Core::new().unwrap();
