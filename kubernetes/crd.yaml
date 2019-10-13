@@ -1,0 +1,46 @@
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: pstn-connections.alpha.matt-williams.github.io
+spec:
+  group: alpha.matt-williams.github.io
+  versions:
+    - name: v1
+      served: true
+      storage: true
+  scope: Namespaced
+  names:
+    plural: pstn-connections
+    singular: pstn-connection
+    kind: PstnConnection
+    shortNames:
+    - pstn
+  validation:
+    openAPIV3Schema:
+      type: object
+      properties:
+        spec:
+          type: object
+          properties:
+            provider:
+              type: object
+              properties:
+                simwood:
+                  type: object
+                  required: [account, username, password]
+                  properties:
+                    account:
+                      type: string
+                    username:
+                      type: string
+                    password:
+                      type: string
+            inbound:
+              type: object
+              properties:
+                numbers:
+                  type: integer
+                service:
+                  type: string
+            outbound:
+              type: boolean
