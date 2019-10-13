@@ -37,6 +37,7 @@ use simwood_rs::{ApiNoContext, ContextWrapperExt,
                       GetMyIpResponse,
                       GetTimeResponse
                      };
+use simwood_rs::models;
 
 use kube::{
     api::{Informer, Object, RawApi, Void, WatchEvent},
@@ -72,20 +73,74 @@ pub struct PstnConnectionSpec {
 // The kubernetes generic object with our spec and no status
 type PstnConnection = Object<PstnConnectionSpec, Void>;
 
+// Global constants
+const AC_NUM: &str = "931210";
+
 fn main() -> Result<(), failure::Error> {
 
     env_logger::init();
     
     let config = config::load_kube_config().expect("failed to load kubeconfig");
-    let client = APIClient::new(config);
+    let kube_client = APIClient::new(config);
     let namespace = std::env::var("NAMESPACE").unwrap_or("default".into());
 
-    // This example requires `kubectl apply -f examples/foo.yaml` run first
+    // Requires `kubectl apply -f examples/pstn-connection.yaml` run first
     let resource = RawApi::customResource("pstn-connections")
         .group("alpha.matt-williams.github.io")
         .within(&namespace);
 
-    let informer : Informer<PstnConnection> = Informer::raw(client, resource).init()?;
+    let mut core = reactor::Core::new().unwrap();
+    let is_https = true;
+    let base_url = "https://api.simwood.com/";
+
+    let simwood_client = simwood_rs::Client::try_new_https(core.handle(), &base_url, "ca.pem")
+            .expect("Failed to create HTTPS client");
+
+    let context: make_context_ty!(ContextBuilder, EmptyContext, Option<AuthData>, XSpanIdString) =
+        make_context!(ContextBuilder, EmptyContext, Some(AuthData::basic("ca54d1be2a5a219c10fd3b64940a6aa3d1476ae5", "cc1c5dcc77a4c660e1c2c7f9e5ada652ac85f09e")) as Option<AuthData>, XSpanIdString(self::uuid::Uuid::new_v4().to_string()));
+
+    let simwood_client = simwood_client.with_context(context);
+
+                    // Get available numbers
+                    let result = core.run(simwood_client.get_available_numbers(AC_NUM.to_string(), "standard".to_string(), 1, None));
+                    println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+                    match result {
+                        Ok(GetAvailableNumbersResponse::Success(success_result)) => {
+                            println!("Country code: {:?} Number: {:?}", success_result[0].country_code, success_result[0].number);
+                            let directory_number = match success_result[0] {
+                                models::AvailableNumber{country_code: Some(ref cc), number: Some(ref num), ..} => cc.to_string() + num,
+                                _ => "".to_string(),
+                            };
+                            println!("Directory number: {}", directory_number);
+
+                            // Put allocated number
+                            let result = core.run(simwood_client.put_allocated_number(AC_NUM.to_string(), directory_number.to_string()));
+                            println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+
+                            // Configure route
+                            let config = models::NumberConfig {
+                            options: Some(models::NumberConfigOptions {
+                                enabled: Some(true),
+                                ..models::NumberConfigOptions::new()
+                            }),
+                            routing: Some([
+                                ( "default".to_string(), vec![vec![
+                                    models::RoutingEntry {
+                                        endpoint: Some("%number@ec2-35-173-185-145.compute-1.amazonaws.com:5080".to_string()),
+                                        ..models::RoutingEntry::new()
+                                    }
+                                ]])
+                                ].iter().cloned().collect()),
+                            };
+                            let result = core.run(simwood_client.put_number_config(AC_NUM.to_string(), directory_number.to_string(), Some(config)));
+                        println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+                        },
+                        _ => {
+                            println!("Error retrieving available numbers");
+                        },
+                    }
+
+    let informer : Informer<PstnConnection> = Informer::raw(kube_client, resource).init()?;
     loop {
         informer.poll()?;
 
@@ -100,24 +155,7 @@ fn main() -> Result<(), failure::Error> {
                 event => {
                     println!("Another event occurred: {:?}", event);
                 }
-
             }
         }
     }
-
-    let mut core = reactor::Core::new().unwrap();
-    let is_https = true;
-    let base_url = "https://api.simwood.com/";
-
-    let client = simwood_rs::Client::try_new_https(core.handle(), &base_url, "ca.pem")
-            .expect("Failed to create HTTPS client");
-
-    let context: make_context_ty!(ContextBuilder, EmptyContext, Option<AuthData>, XSpanIdString) =
-        make_context!(ContextBuilder, EmptyContext, Some(AuthData::basic("ca54d1be2a5a219c10fd3b64940a6aa3d1476ae5", "cc1c5dcc77a4c660e1c2c7f9e5ada652ac85f09e")) as Option<AuthData>, XSpanIdString(self::uuid::Uuid::new_v4().to_string()));
-
-    let client = client.with_context(context);
-
-            let result = core.run(client.get_account_type("931210".to_string()));
-            println!("{:?} (X-Span-ID: {:?})", result, (client.context() as &Has<XSpanIdString>).get().clone());
-
 }
