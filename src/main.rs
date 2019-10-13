@@ -133,7 +133,11 @@ fn main() -> Result<(), failure::Error> {
                                 ].iter().cloned().collect()),
                             };
                             let result = core.run(simwood_client.put_number_config(AC_NUM.to_string(), directory_number.to_string(), Some(config)));
-                        println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+                            println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+
+                            // Delete allocated number and configuration
+                            let result = core.run(simwood_client.delete_allocated_number(AC_NUM.to_string(), directory_number.to_string()));
+                            println!("{:?} (X-Span-ID: {:?})", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
                         },
                         _ => {
                             println!("Error retrieving available numbers");
