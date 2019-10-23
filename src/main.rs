@@ -11,24 +11,26 @@ extern crate log;
 #[macro_use]
 extern crate serde_derive;
 extern crate hyper;
+extern crate k8s_openapi;
 
 use swagger::{AuthData, ContextBuilder, EmptyContext, Push, XSpanIdString};
 
 use futures::{future, Future};
 use simwood_rs::models;
 use simwood_rs::{
-    Api, DeleteAllocatedNumberResponse, GetAvailableNumbersResponse, PutAllocatedNumberResponse,
-    PutNumberConfigResponse,
+    Api as SimwoodApi, DeleteAllocatedNumberResponse, GetAvailableNumbersResponse,
+    PutAllocatedNumberResponse, PutNumberConfigResponse,
 };
 use tokio_core::reactor;
 
+use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
 use kube::{
-    api::{Informer, Object, PostParams, RawApi, WatchEvent},
+    api::{Api, Informer, ListParams, Object, ObjectList, PostParams, RawApi, WatchEvent},
     client::APIClient,
     config,
 };
 
-// Own custom resource spec
+// Own custom resources spec
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Simwood {
     account: String,
@@ -99,12 +101,16 @@ fn main() -> Result<(), failure::Error> {
     let kube_client = APIClient::new(config);
     let namespace = std::env::var("NAMESPACE").unwrap_or("default".into());
 
+    let services = Api::v1Service(kube_client.clone());
+    let nodes = Api::v1Node(kube_client.clone());
+
     // Requires `kubectl apply -f kubernetes/crd.yaml` run first
-    let resource = RawApi::customResource("pstn-connections")
+    let pstn_connections = RawApi::customResource("pstn-connections")
         .group("alpha.matt-williams.github.io")
         .within(&namespace);
 
-    let informer: Informer<PstnConnection> = Informer::raw(kube_client, resource.clone()).init()?;
+    let informer: Informer<PstnConnection> =
+        Informer::raw(kube_client, pstn_connections.clone()).init()?;
 
     // Instantiate Simwood client
     let mut core = reactor::Core::new().unwrap();
@@ -118,11 +124,83 @@ fn main() -> Result<(), failure::Error> {
         while let Some(event) = informer.pop() {
             match event {
                 WatchEvent::Added(pstn) => {
+                    info!("PSTN connection {} added", pstn.metadata.name);
                     let name = pstn.metadata.name.clone();
+
+                    let service_sip_uri = pstn.spec.inbound.as_ref().and_then(|inbound| {
+                        let mut service_sip_uri = None;
+                        match services.get(&inbound.service) {
+                            Ok(Object { ref spec, .. }) => match spec {
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    external_name: Some(external_name),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "ExternalName" => {
+                                    let sip_uri = build_sip_uri(external_name, ports.first());
+                                    info!("Service {} is of type ExternalName - constructed SIP URI {}", &inbound.service, sip_uri);
+                                    service_sip_uri = Some(sip_uri);
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "NodePort" => {
+                                    match nodes.list(&ListParams::default()) {
+                                        Ok(ObjectList { items, .. }) => match items
+                                            .first()
+                                            .and_then(|n| n.status.as_ref())
+                                            .and_then(|s| s.addresses.as_ref())
+                                            .and_then(|a| {
+                                                a.iter()
+                                                    .filter(|a| {
+                                                        a.type_ == "Hostname"
+                                                            || a.type_ == "ExternalIP"
+                                                    })
+                                                    .nth(0)
+                                            }) {
+                                            Some(ref address) => {
+                                                let sip_uri = build_sip_uri(&address.address, ports.first());
+                                                info!("Service {} is of type NodePort - constructed SIP URI {}", &inbound.service, sip_uri);
+                                                service_sip_uri = Some(sip_uri);
+                                            }
+                                            None => warn!("Service {} is of type NodePort but no hostname or external IP found - can't construct routable SIP URI", &inbound.service),
+                                        },
+                                        Err(_) => warn!("Failed to query node resources"),
+                                    }
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    load_balancer_ip: Some(load_balancer_ip),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "LoadBalancer" => {
+                                    let sip_uri = build_sip_uri(load_balancer_ip, ports.first());
+                                    info!("Service {} is of type LoadBalancer - constructed SIP URI {}", &inbound.service, sip_uri);
+                                    service_sip_uri = Some(sip_uri);
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    ..
+                                } if type_ == "ClusterIP" => warn!("Service {} is of type ClusterIP - not externally routable", &inbound.service),
+                                ServiceSpec {
+                                    type_: Some(type_), ..
+                                } => warn!("Service {} is of type {} - unsupported", &inbound.service, type_),
+                                ServiceSpec { type_: None, .. } => warn!("Service {} has no type specified - unsupported", &inbound.service),
+                            },
+                            Err(_) => warn!("Failed to query service {}", &inbound.service),
+                        }
+                        service_sip_uri
+                    });
+
                     let status = core
-                        .run(handle_pstn_connection_add(pstn, &simwood_client))
+                        .run(handle_pstn_connection_add(
+                            pstn,
+                            service_sip_uri,
+                            &simwood_client,
+                        ))
                         .unwrap();
-                    match resource.replace_status(
+                    match pstn_connections.replace_status(
                         &name,
                         &PostParams { dry_run: false },
                         serde_json::to_vec(&status).unwrap(),
@@ -135,17 +213,41 @@ fn main() -> Result<(), failure::Error> {
                     "PSTN connection {} modified - unsupported!",
                     pstn.metadata.name
                 ),
-                WatchEvent::Deleted(pstn) => core
-                    .run(handle_pstn_connection_delete(pstn, &simwood_client))
-                    .unwrap(),
+                WatchEvent::Deleted(pstn) => {
+                    info!("PSTN connection {} deleted", pstn.metadata.name);
+                    core.run(handle_pstn_connection_delete(pstn, &simwood_client))
+                        .unwrap();
+                }
                 WatchEvent::Error(error) => warn!("Watch error occurred: {}", error.to_string()),
             }
         }
     }
 }
 
+fn build_sip_uri(host: &str, port: Option<&ServicePort>) -> String {
+    let mut sip_uri = format!("sip:{}", host);
+    if let Some(port) = port {
+        if let ServicePort {
+            node_port: Some(port),
+            ..
+        } = port
+        {
+            sip_uri = format!("{}:{}", sip_uri, port);
+        }
+        if let ServicePort {
+            protocol: Some(protocol),
+            ..
+        } = port
+        {
+            sip_uri = format!("{};transport={}", sip_uri, protocol);
+        }
+    }
+    sip_uri
+}
+
 fn handle_pstn_connection_add(
     pstn: PstnConnection,
+    service_sip_uri: Option<String>,
     simwood_client: &simwood_rs::Client<hyper::client::FutureResponse>,
 ) -> Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static> {
     match pstn.spec.provider {
@@ -153,8 +255,8 @@ fn handle_pstn_connection_add(
             simwood: Some(ref simwood),
         } => {
             info!(
-                "PSTN connection {} added for Simwood account {}\n",
-                pstn.metadata.name, simwood.account
+                "Using Simwood account {} with username {}",
+                simwood.account, simwood.username
             );
             let context = make_simwood_context(simwood);
             Box::new(simwood_client.get_available_numbers(
@@ -190,7 +292,6 @@ fn handle_pstn_connection_add(
                                     );
 
                                     // Configure route
-                                    let endpoint = "%number@ec2-35-173-185-145.compute-1.amazonaws.com:5080".to_string();
                                     let config = models::NumberConfig {
                                         options: Some(
                                             models::NumberConfigOptions {
@@ -202,9 +303,7 @@ fn handle_pstn_connection_add(
                                             [(
                                                 "default".to_string(),
                                                 vec![vec![models::RoutingEntry {
-                                                    endpoint: Some(
-                                                        endpoint.clone(),
-                                                    ),
+                                                    endpoint: service_sip_uri.clone(),
                                                     ..models::RoutingEntry::new()
                                                 }]],
                                             )]
@@ -220,7 +319,7 @@ fn handle_pstn_connection_add(
                                             &context
                                         ).then(move |result| {match result {
                                             Ok(PutNumberConfigResponse::Success(_)) => {
-                                                info!("Set routing configuration for number {} to {}", number, endpoint);
+                                                info!("Set routing configuration for number {} to {}", number, service_sip_uri.unwrap_or("<none>".to_string()));
                                                 future::ok(PstnConnectionStatus{status: Status::Synchronized, numbers: vec![number]})
                                             },
                                             Ok(PutNumberConfigResponse::NumberNotAllocated) => {
@@ -282,8 +381,8 @@ fn handle_pstn_connection_delete(
             simwood: Some(ref simwood),
         } => {
             info!(
-                "PSTN connection {} deleted for Simwood account {}\n",
-                pstn.metadata.name, simwood.account
+                "Using Simwood account {} with username {}",
+                simwood.account, simwood.username
             );
             let context = make_simwood_context(simwood);
 
