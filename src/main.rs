@@ -20,11 +20,10 @@ use simwood_rs::{
     Api, DeleteAllocatedNumberResponse, GetAvailableNumbersResponse, PutAllocatedNumberResponse,
     PutNumberConfigResponse,
 };
-use std::sync::{Arc, Mutex};
 use tokio_core::reactor;
 
 use kube::{
-    api::{Informer, Object, RawApi, Void, WatchEvent},
+    api::{Informer, Object, PostParams, RawApi, WatchEvent},
     client::APIClient,
     config,
 };
@@ -54,8 +53,28 @@ pub struct PstnConnectionSpec {
     inbound: Option<Inbound>,
     outbound: Option<bool>,
 }
+
+#[derive(Deserialize, Serialize, Clone)]
+pub enum Status {
+    Unsynchronized,
+    Synchronized,
+    Failed,
+    UnknownProvider,
+}
+impl Default for Status {
+    fn default() -> Self {
+        Status::Unsynchronized
+    }
+}
+
+#[derive(Default, Deserialize, Serialize, Clone)]
+pub struct PstnConnectionStatus {
+    status: Status,
+    numbers: Vec<String>,
+}
+
 // The kubernetes generic object with our spec and no status
-type PstnConnection = Object<PstnConnectionSpec, Void>;
+type PstnConnection = Object<PstnConnectionSpec, PstnConnectionStatus>;
 
 type SimwoodContext = make_context_ty!(
     ContextBuilder,
@@ -73,8 +92,6 @@ fn make_simwood_context(simwood: &Simwood) -> SimwoodContext {
 }
 
 fn main() -> Result<(), failure::Error> {
-    let mut directory_number = Arc::new(Mutex::new("".to_string()));
-
     // Instantiate Kubernetes client
     env_logger::init();
 
@@ -87,7 +104,7 @@ fn main() -> Result<(), failure::Error> {
         .group("alpha.matt-williams.github.io")
         .within(&namespace);
 
-    let informer: Informer<PstnConnection> = Informer::raw(kube_client, resource).init()?;
+    let informer: Informer<PstnConnection> = Informer::raw(kube_client, resource.clone()).init()?;
 
     // Instantiate Simwood client
     let mut core = reactor::Core::new().unwrap();
@@ -99,26 +116,30 @@ fn main() -> Result<(), failure::Error> {
     loop {
         informer.poll()?;
         while let Some(event) = informer.pop() {
-            core.run(match event {
+            match event {
                 WatchEvent::Added(pstn) => {
-                    handle_pstn_connection_add(pstn, &simwood_client, &mut directory_number)
+                    let name = pstn.metadata.name.clone();
+                    let status = core
+                        .run(handle_pstn_connection_add(pstn, &simwood_client))
+                        .unwrap();
+                    match resource.replace_status(
+                        &name,
+                        &PostParams { dry_run: false },
+                        serde_json::to_vec(&status).unwrap(),
+                    ) {
+                        Ok(_) => info!("Updated status for PSTN connection {}", name),
+                        Err(_) => warn!("Failed to update status for PSTN connection {}", name),
+                    }
                 }
-                WatchEvent::Modified(pstn) => {
-                    warn!(
-                        "PSTN connection {} modified - unsupported!",
-                        pstn.metadata.name
-                    );
-                    Box::new(future::ok(()))
-                }
-                WatchEvent::Deleted(pstn) => {
-                    handle_pstn_connection_delete(pstn, &simwood_client, &directory_number)
-                }
-                WatchEvent::Error(error) => {
-                    warn!("Watch error occurred: {}", error.to_string());
-                    Box::new(future::ok(()))
-                }
-            })
-            .unwrap(); // TODO: Get rid of unwrap - in futures 0.3, this will naturally go away
+                WatchEvent::Modified(pstn) => warn!(
+                    "PSTN connection {} modified - unsupported!",
+                    pstn.metadata.name
+                ),
+                WatchEvent::Deleted(pstn) => core
+                    .run(handle_pstn_connection_delete(pstn, &simwood_client))
+                    .unwrap(),
+                WatchEvent::Error(error) => warn!("Watch error occurred: {}", error.to_string()),
+            }
         }
     }
 }
@@ -126,14 +147,13 @@ fn main() -> Result<(), failure::Error> {
 fn handle_pstn_connection_add(
     pstn: PstnConnection,
     simwood_client: &simwood_rs::Client<hyper::client::FutureResponse>,
-    directory_number: &Arc<Mutex<String>>,
-) -> Box<dyn Future<Item = (), Error = ()> + 'static> {
+) -> Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static> {
     match pstn.spec.provider {
         Provider {
             simwood: Some(ref simwood),
         } => {
             info!(
-                "Pstn connection {} added for Simwood account {}\n",
+                "PSTN connection {} added for Simwood account {}\n",
                 pstn.metadata.name, simwood.account
             );
             let context = make_simwood_context(simwood);
@@ -146,7 +166,6 @@ fn handle_pstn_connection_add(
             ).then({
                 let simwood = simwood.clone();
                 let simwood_client = simwood_client.clone();
-                let directory_number = directory_number.clone();
                 move |result| match result {
                 Ok(GetAvailableNumbersResponse::Success(success_result)) => {
                     match success_result[0] {
@@ -155,26 +174,20 @@ fn handle_pstn_connection_add(
                             number: Some(ref num),
                             ..
                         } => {
-                            let directory_number: String = {
-                                let mut directory_number = directory_number.lock().unwrap();
-                                *directory_number = cc.to_string() + num;
-                                directory_number.clone()
-                            };
-                            info!("Found available number {}", directory_number);
+                            let number: String = cc.to_string() + num;
+                            info!("Found available number {}", number);
 
                             // Put allocated number
                             Box::new(simwood_client.put_allocated_number(
                                 simwood.account.clone(),
-                                directory_number.to_string(),
+                                number.clone(),
                                 &context
                             ).then(move |result| match result {
                                 Ok(PutAllocatedNumberResponse::Success) => {
                                     info!(
                                         "Claimed available number {}",
-                                        directory_number
+                                        number
                                     );
-
-                                    // TODO: Store directory number in Kubernetes status
 
                                     // Configure route
                                     let endpoint = "%number@ec2-35-173-185-145.compute-1.amazonaws.com:5080".to_string();
@@ -202,55 +215,60 @@ fn handle_pstn_connection_add(
                                     };
                                     Box::new(simwood_client.put_number_config(
                                             simwood.account.clone(),
-                                            directory_number.to_string(),
+                                            number.to_string(),
                                             Some(config),
                                             &context
                                         ).then(move |result| {match result {
-                                        Ok(PutNumberConfigResponse::Success(_)) =>
-                                            info!("Set routing configuration for number {} to {}", directory_number, endpoint),
-                                        Ok(PutNumberConfigResponse::NumberNotAllocated) =>
-                                            warn!("Claimed number {} no longer allocated when setting routing configuration", directory_number),
-                                        Err(error) =>
-                                            warn!("Failed to set routing configuration for number {}: {}", directory_number, error.0),
-                                        };
-                                        future::ok(())
-                                        })) as Box<dyn Future<Item=(), Error=()> + 'static>
+                                            Ok(PutNumberConfigResponse::Success(_)) => {
+                                                info!("Set routing configuration for number {} to {}", number, endpoint);
+                                                future::ok(PstnConnectionStatus{status: Status::Synchronized, numbers: vec![number]})
+                                            },
+                                            Ok(PutNumberConfigResponse::NumberNotAllocated) => {
+                                                warn!("Claimed number {} no longer allocated when setting routing configuration", number);
+                                                future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![number.clone()]})
+                                            },
+                                            Err(error) => {
+                                                warn!("Failed to set routing configuration for number {}: {}", number, error.0);
+                                                future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![number.clone()]})
+                                            }
+                                        }
+                                        })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                                 }
                                 Ok(
                                     PutAllocatedNumberResponse::NumberNotAvailable,
                                 ) => {
                                     // TODO: Handle this race condition
-                                    warn!("Available number {} not available after all", directory_number);
-                                    Box::new(future::ok(())) as Box<dyn Future<Item=(), Error=()> + 'static>
+                                    warn!("Available number {} not available after all", number);
+                                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                                 }
                                 Err(error) => {
-                                    warn!(
-                                    "Failed to claim available number: {}",
-                                    error.0
-                                );
-                                    Box::new(future::ok(())) as Box<dyn Future<Item=(), Error=()> + 'static>
+                                    warn!("Failed to claim available number: {}", error.0);
+                                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                                 },
-                            })) as Box<dyn Future<Item=(), Error=()> + 'static>
+                            })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                         },
                         _ => { warn!(
                             "Failed to parse available number - got {:?}",
                             success_result[0]);
-                            Box::new(future::ok(())) as Box<dyn Future<Item=(), Error=()> + 'static>
+                            Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                         }
                     }
                 },
                 Err(error) => {
                     warn!("Failed to retrieve available number: {}", error.0);
-                    Box::new(future::ok(())) as Box<dyn Future<Item=(), Error=()> + 'static>
+                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                 }
-            }})) as Box<dyn Future<Item=(), Error=()> + 'static>
+            }})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
         }
         _ => {
             warn!(
                 "PSTN connection {} added with unknown provider",
                 pstn.metadata.name
             );
-            Box::new(future::ok(())) as Box<dyn Future<Item = (), Error = ()> + 'static>
+            Box::new(future::ok(PstnConnectionStatus {
+                status: Status::UnknownProvider,
+                numbers: vec![],
+            })) as Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static>
         }
     }
 }
@@ -258,43 +276,54 @@ fn handle_pstn_connection_add(
 fn handle_pstn_connection_delete(
     pstn: PstnConnection,
     simwood_client: &simwood_rs::Client<hyper::client::FutureResponse>,
-    directory_number: &Arc<Mutex<String>>,
 ) -> Box<dyn Future<Item = (), Error = ()> + 'static> {
     match pstn.spec.provider {
         Provider {
             simwood: Some(ref simwood),
         } => {
             info!(
-                "Pstn connection {} deleted for Simwood account {}\n",
+                "PSTN connection {} deleted for Simwood account {}\n",
                 pstn.metadata.name, simwood.account
             );
             let context = make_simwood_context(simwood);
 
-            let directory_number = directory_number.lock().unwrap().clone();
-
             // Delete allocated number
+            let delete_futures: Vec<_> = pstn
+                .status
+                .map(|s| s.numbers)
+                .unwrap_or_else(|| Vec::new())
+                .iter()
+                .cloned()
+                .map({
+                    let simwood = simwood.clone();
+                    let simwood_client = simwood_client.clone();
+                    let context = context.clone();
+                    move |number| {
+                        simwood_client
+                            .delete_allocated_number(
+                                simwood.account.clone(),
+                                number.clone(),
+                                &context,
+                            )
+                            .then(move |result| {
+                                match result {
+                                    Ok(DeleteAllocatedNumberResponse::Success) => {
+                                        info!("Deleted number {}", number)
+                                    }
+                                    Ok(DeleteAllocatedNumberResponse::NumberNotAllocated) => {
+                                        info!("Failed to delete number {} - not allocated", number)
+                                    }
+                                    Err(error) => {
+                                        warn!("Failed to delete number {}: {}", number, error.0)
+                                    }
+                                }
+                                future::ok(())
+                            })
+                    }
+                })
+                .collect();
             Box::new(
-                simwood_client
-                    .delete_allocated_number(
-                        simwood.account.clone(),
-                        directory_number.clone(),
-                        &context,
-                    )
-                    .then(move |result| {
-                        match result {
-                            Ok(DeleteAllocatedNumberResponse::Success) => {
-                                info!("Deleted number {}", directory_number)
-                            }
-                            Ok(DeleteAllocatedNumberResponse::NumberNotAllocated) => info!(
-                                "Failed to delete number {} - not allocated",
-                                directory_number
-                            ),
-                            Err(error) => {
-                                warn!("Failed to delete number {}: {}", directory_number, error.0)
-                            }
-                        }
-                        future::ok(())
-                    }),
+                future::join_all(delete_futures).then(move |_: Result<Vec<()>, ()>| future::ok(())),
             ) as Box<dyn Future<Item = (), Error = ()> + 'static>
         }
         _ => {
