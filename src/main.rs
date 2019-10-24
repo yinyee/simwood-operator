@@ -58,24 +58,18 @@ pub struct PstnConnectionSpec {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub enum Status {
-    Unsynchronized,
     Synchronized,
     Failed,
     UnknownProvider,
 }
-impl Default for Status {
-    fn default() -> Self {
-        Status::Unsynchronized
-    }
-}
 
 #[derive(Default, Deserialize, Serialize, Clone)]
 pub struct PstnConnectionStatus {
-    status: Status,
-    numbers: Vec<String>,
+    status: Option<Status>,
+    numbers: Option<Vec<String>>,
 }
 
-// The kubernetes generic object with our spec and no status
+// The kubernetes generic object with our spec and status
 type PstnConnection = Object<PstnConnectionSpec, PstnConnectionStatus>;
 
 type SimwoodContext = make_context_ty!(
@@ -97,28 +91,25 @@ fn main() -> Result<(), failure::Error> {
     // Instantiate Kubernetes client
     env_logger::init();
 
+    // Load kubeconfig and create a client
     let config = config::load_kube_config().expect("failed to load kubeconfig");
     let kube_client = APIClient::new(config);
-    let namespace = std::env::var("NAMESPACE").unwrap_or("default".into());
 
+    // Get the resources we need to manage
     let services = Api::v1Service(kube_client.clone());
     let nodes = Api::v1Node(kube_client.clone());
-
-    // Requires `kubectl apply -f kubernetes/crd.yaml` run first
     let pstn_connections = RawApi::customResource("pstn-connections")
-        .group("alpha.matt-williams.github.io")
-        .within(&namespace);
-
-    let informer: Informer<PstnConnection> =
-        Informer::raw(kube_client, pstn_connections.clone()).init()?;
+        .group("alpha.matt-williams.github.io");
 
     // Instantiate Simwood client
     let mut core = reactor::Core::new().unwrap();
     let base_url = "https://api.simwood.com/";
-
     let simwood_client = simwood_rs::Client::try_new_https(core.handle(), &base_url, "ca.pem")
         .expect("Failed to create HTTPS client");
 
+    // Create an informer and watch for changes to PSTN connections
+    let informer: Informer<PstnConnection> =
+        Informer::raw(kube_client, pstn_connections.clone()).init()?;
     loop {
         informer.poll()?;
         while let Some(event) = informer.pop() {
@@ -320,15 +311,15 @@ fn handle_pstn_connection_add(
                                         ).then(move |result| {match result {
                                             Ok(PutNumberConfigResponse::Success(_)) => {
                                                 info!("Set routing configuration for number {} to {}", number, service_sip_uri.unwrap_or("<none>".to_string()));
-                                                future::ok(PstnConnectionStatus{status: Status::Synchronized, numbers: vec![number]})
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Synchronized), numbers: Some(vec![number])})
                                             },
                                             Ok(PutNumberConfigResponse::NumberNotAllocated) => {
                                                 warn!("Claimed number {} no longer allocated when setting routing configuration", number);
-                                                future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![number.clone()]})
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Failed), numbers: Some(vec![number.clone()])})
                                             },
                                             Err(error) => {
                                                 warn!("Failed to set routing configuration for number {}: {}", number, error.0);
-                                                future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![number.clone()]})
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Failed), numbers: Some(vec![number.clone()])})
                                             }
                                         }
                                         })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
@@ -338,24 +329,24 @@ fn handle_pstn_connection_add(
                                 ) => {
                                     // TODO: Handle this race condition
                                     warn!("Available number {} not available after all", number);
-                                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                                 }
                                 Err(error) => {
                                     warn!("Failed to claim available number: {}", error.0);
-                                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                                 },
                             })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                         },
                         _ => { warn!(
                             "Failed to parse available number - got {:?}",
                             success_result[0]);
-                            Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                            Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                         }
                     }
                 },
                 Err(error) => {
                     warn!("Failed to retrieve available number: {}", error.0);
-                    Box::new(future::ok(PstnConnectionStatus{status: Status::Failed, numbers: vec![]})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                 }
             }})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
         }
@@ -365,8 +356,8 @@ fn handle_pstn_connection_add(
                 pstn.metadata.name
             );
             Box::new(future::ok(PstnConnectionStatus {
-                status: Status::UnknownProvider,
-                numbers: vec![],
+                status: Some(Status::UnknownProvider),
+                ..PstnConnectionStatus::default()
             })) as Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static>
         }
     }
@@ -389,7 +380,7 @@ fn handle_pstn_connection_delete(
             // Delete allocated number
             let delete_futures: Vec<_> = pstn
                 .status
-                .map(|s| s.numbers)
+                .and_then(|s| s.numbers)
                 .unwrap_or_else(|| Vec::new())
                 .iter()
                 .cloned()
