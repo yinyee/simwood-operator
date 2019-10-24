@@ -21,6 +21,7 @@ spec:
       properties:
         spec:
           type: object
+          required: [provider]
           properties:
             provider:
               type: object
@@ -37,6 +38,7 @@ spec:
                       type: string
             inbound:
               type: object
+              required: [numbers, service]
               properties:
                 numbers:
                   type: integer

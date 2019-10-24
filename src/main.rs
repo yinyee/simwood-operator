@@ -1,51 +1,36 @@
-#![allow(missing_docs, unused_variables, trivial_casts)]
+#![allow(missing_docs)]
 
-extern crate simwood_rs;
-#[allow(unused_extern_crates)]
 extern crate futures;
-#[allow(unused_extern_crates)]
+extern crate simwood_rs;
 #[macro_use]
 extern crate swagger;
-#[allow(unused_extern_crates)]
 extern crate tokio_core;
 extern crate uuid;
-#[macro_use] extern crate log;
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate log;
+#[macro_use]
+extern crate serde_derive;
+extern crate hyper;
+extern crate k8s_openapi;
 
-use swagger::{ContextBuilder, EmptyContext, XSpanIdString, Has, Push, AuthData};
+use swagger::{AuthData, ContextBuilder, EmptyContext, Push, XSpanIdString};
 
-#[allow(unused_imports)]
-use futures::{Future, future, Stream, stream};
-use tokio_core::reactor;
-#[allow(unused_imports)]
-use simwood_rs::{ApiNoContext, ContextWrapperExt,
-                      ApiError,
-                      GetAccountTypeResponse,
-                      DeleteAllocatedNumberResponse,
-                      GetAllocatedNumberResponse,
-                      GetAllocatedNumbersResponse,
-                      GetAvailableNumbersResponse,
-                      GetNumberRangesResponse,
-                      PutAllocatedNumberResponse,
-                      DeleteOutboundAclIpResponse,
-                      DeleteOutboundTrunkResponse,
-                      GetOutboundAclIpsResponse,
-                      GetOutboundTrunkResponse,
-                      GetOutboundTrunksResponse,
-                      PutOutboundAclIpResponse,
-                      PutOutboundTrunkResponse,
-                      GetMyIpResponse,
-                      GetTimeResponse
-                     };
+use futures::{future, Future};
 use simwood_rs::models;
+use simwood_rs::{
+    Api as SimwoodApi, DeleteAllocatedNumberResponse, GetAvailableNumbersResponse,
+    PutAllocatedNumberResponse, PutNumberConfigResponse,
+};
+use tokio_core::reactor;
 
+use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
 use kube::{
-    api::{Informer, Object, RawApi, Void, WatchEvent},
+    api::{Api, Informer, ListParams, Object, ObjectList, PostParams, RawApi, WatchEvent},
     client::APIClient,
     config,
 };
 
-// Own custom resource spec
+// Own custom resources spec
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Simwood {
     account: String,
@@ -55,7 +40,7 @@ pub struct Simwood {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Provider {
-    simwood: Simwood,
+    simwood: Option<Simwood>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -67,110 +52,376 @@ pub struct Inbound {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PstnConnectionSpec {
     provider: Provider,
-    inbound: Inbound,
-    outbound: bool,
+    inbound: Option<Inbound>,
+    outbound: Option<bool>,
 }
-// The kubernetes generic object with our spec and no status
-type PstnConnection = Object<PstnConnectionSpec, Void>;
 
-// Global constants
-const AC_NUM: &str = "931210";
-const API_USER: &str = "ca54d1be2a5a219c10fd3b64940a6aa3d1476ae5";
-const API_PASSWORD: &str = "cc1c5dcc77a4c660e1c2c7f9e5ada652ac85f09e";
+#[derive(Deserialize, Serialize, Clone)]
+pub enum Status {
+    Synchronized,
+    Failed,
+    UnknownProvider,
+}
+
+#[derive(Default, Deserialize, Serialize, Clone)]
+pub struct PstnConnectionStatus {
+    status: Option<Status>,
+    numbers: Option<Vec<String>>,
+}
+
+// The kubernetes generic object with our spec and status
+type PstnConnection = Object<PstnConnectionSpec, PstnConnectionStatus>;
+
+type SimwoodContext = make_context_ty!(
+    ContextBuilder,
+    EmptyContext,
+    Option<AuthData>,
+    XSpanIdString
+);
+fn make_simwood_context(simwood: &Simwood) -> SimwoodContext {
+    make_context!(
+        ContextBuilder,
+        EmptyContext,
+        Some(AuthData::basic(&simwood.username, &simwood.password)) as Option<AuthData>,
+        XSpanIdString(self::uuid::Uuid::new_v4().to_string())
+    )
+}
 
 fn main() -> Result<(), failure::Error> {
-
-    let mut directory_number = "".to_string();
-
     // Instantiate Kubernetes client
     env_logger::init();
-    
+
+    // Load kubeconfig and create a client
     let config = config::load_kube_config().expect("failed to load kubeconfig");
     let kube_client = APIClient::new(config);
-    let namespace = std::env::var("NAMESPACE").unwrap_or("default".into());
 
-    // Requires `kubectl apply -f examples/pstn-connection.yaml` run first
-    let resource = RawApi::customResource("pstn-connections")
-        .group("alpha.matt-williams.github.io")
-        .within(&namespace);
-
-    let informer : Informer<PstnConnection> = Informer::raw(kube_client, resource).init()?;
+    // Get the resources we need to manage
+    let services = Api::v1Service(kube_client.clone());
+    let nodes = Api::v1Node(kube_client.clone());
+    let pstn_connections = RawApi::customResource("pstn-connections")
+        .group("alpha.matt-williams.github.io");
 
     // Instantiate Simwood client
     let mut core = reactor::Core::new().unwrap();
     let base_url = "https://api.simwood.com/";
-
     let simwood_client = simwood_rs::Client::try_new_https(core.handle(), &base_url, "ca.pem")
-            .expect("Failed to create HTTPS client");
-    let context: make_context_ty!(ContextBuilder, EmptyContext, Option<AuthData>, XSpanIdString) =
-        make_context!(ContextBuilder, EmptyContext, Some(AuthData::basic(API_USER, API_PASSWORD)) as Option<AuthData>, XSpanIdString(self::uuid::Uuid::new_v4().to_string()));
-    let simwood_client = simwood_client.with_context(context);
+        .expect("Failed to create HTTPS client");
 
+    // Create an informer and watch for changes to PSTN connections
+    let informer: Informer<PstnConnection> =
+        Informer::raw(kube_client, pstn_connections.clone()).init()?;
     loop {
-
         informer.poll()?;
         while let Some(event) = informer.pop() {
             match event {
                 WatchEvent::Added(pstn) => {
+                    info!("PSTN connection {} added", pstn.metadata.name);
+                    let name = pstn.metadata.name.clone();
 
-                    println!("ADDED PSTN CONNECTION {} FOR ACCOUNT {}\n", pstn.metadata.name, pstn.spec.provider.simwood.account);
-                    
-                    // Get available numbers
-                    let result = core.run(simwood_client.get_available_numbers(AC_NUM.to_string(), "standard".to_string(), 1, None));
-                    println!("GET AVAILABLE NUMBER(S): {:?} (X-Span-ID: {:?})\n", result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+                    let service_sip_uri = pstn.spec.inbound.as_ref().and_then(|inbound| {
+                        let mut service_sip_uri = None;
+                        match services.get(&inbound.service) {
+                            Ok(Object { ref spec, .. }) => match spec {
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    external_name: Some(external_name),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "ExternalName" => {
+                                    let sip_uri = build_sip_uri(external_name, ports.first());
+                                    info!("Service {} is of type ExternalName - constructed SIP URI {}", &inbound.service, sip_uri);
+                                    service_sip_uri = Some(sip_uri);
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "NodePort" => {
+                                    match nodes.list(&ListParams::default()) {
+                                        Ok(ObjectList { items, .. }) => match items
+                                            .first()
+                                            .and_then(|n| n.status.as_ref())
+                                            .and_then(|s| s.addresses.as_ref())
+                                            .and_then(|a| {
+                                                a.iter()
+                                                    .filter(|a| {
+                                                        a.type_ == "Hostname"
+                                                            || a.type_ == "ExternalIP"
+                                                    })
+                                                    .nth(0)
+                                            }) {
+                                            Some(ref address) => {
+                                                let sip_uri = build_sip_uri(&address.address, ports.first());
+                                                info!("Service {} is of type NodePort - constructed SIP URI {}", &inbound.service, sip_uri);
+                                                service_sip_uri = Some(sip_uri);
+                                            }
+                                            None => warn!("Service {} is of type NodePort but no hostname or external IP found - can't construct routable SIP URI", &inbound.service),
+                                        },
+                                        Err(_) => warn!("Failed to query node resources"),
+                                    }
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    load_balancer_ip: Some(load_balancer_ip),
+                                    ports: Some(ports),
+                                    ..
+                                } if type_ == "LoadBalancer" => {
+                                    let sip_uri = build_sip_uri(load_balancer_ip, ports.first());
+                                    info!("Service {} is of type LoadBalancer - constructed SIP URI {}", &inbound.service, sip_uri);
+                                    service_sip_uri = Some(sip_uri);
+                                }
+                                ServiceSpec {
+                                    type_: Some(ref type_),
+                                    ..
+                                } if type_ == "ClusterIP" => warn!("Service {} is of type ClusterIP - not externally routable", &inbound.service),
+                                ServiceSpec {
+                                    type_: Some(type_), ..
+                                } => warn!("Service {} is of type {} - unsupported", &inbound.service, type_),
+                                ServiceSpec { type_: None, .. } => warn!("Service {} has no type specified - unsupported", &inbound.service),
+                            },
+                            Err(_) => warn!("Failed to query service {}", &inbound.service),
+                        }
+                        service_sip_uri
+                    });
 
-                    match result {
-                        // Get available numbers: SUCCESS
-                        Ok(GetAvailableNumbersResponse::Success(success_result)) => {
-                            // println!("Country code: {:?} Number: {:?}", success_result[0].country_code, success_result[0].number);
-                            directory_number = match success_result[0] {
-                                models::AvailableNumber{country_code: Some(ref cc), number: Some(ref num), ..} => cc.to_string() + num,
-                                _ => "".to_string(),
-                            };
-                            println!("***Directory number: {}***\n", directory_number);
+                    let status = core
+                        .run(handle_pstn_connection_add(
+                            pstn,
+                            service_sip_uri,
+                            &simwood_client,
+                        ))
+                        .unwrap();
+                    match pstn_connections.replace_status(
+                        &name,
+                        &PostParams { dry_run: false },
+                        serde_json::to_vec(&status).unwrap(),
+                    ) {
+                        Ok(_) => info!("Updated status for PSTN connection {}", name),
+                        Err(_) => warn!("Failed to update status for PSTN connection {}", name),
+                    }
+                }
+                WatchEvent::Modified(pstn) => warn!(
+                    "PSTN connection {} modified - unsupported!",
+                    pstn.metadata.name
+                ),
+                WatchEvent::Deleted(pstn) => {
+                    info!("PSTN connection {} deleted", pstn.metadata.name);
+                    core.run(handle_pstn_connection_delete(pstn, &simwood_client))
+                        .unwrap();
+                }
+                WatchEvent::Error(error) => warn!("Watch error occurred: {}", error.to_string()),
+            }
+        }
+    }
+}
+
+fn build_sip_uri(host: &str, port: Option<&ServicePort>) -> String {
+    let mut sip_uri = format!("sip:{}", host);
+    if let Some(port) = port {
+        if let ServicePort {
+            node_port: Some(port),
+            ..
+        } = port
+        {
+            sip_uri = format!("{}:{}", sip_uri, port);
+        }
+        if let ServicePort {
+            protocol: Some(protocol),
+            ..
+        } = port
+        {
+            sip_uri = format!("{};transport={}", sip_uri, protocol);
+        }
+    }
+    sip_uri
+}
+
+fn handle_pstn_connection_add(
+    pstn: PstnConnection,
+    service_sip_uri: Option<String>,
+    simwood_client: &simwood_rs::Client<hyper::client::FutureResponse>,
+) -> Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static> {
+    match pstn.spec.provider {
+        Provider {
+            simwood: Some(ref simwood),
+        } => {
+            info!(
+                "Using Simwood account {} with username {}",
+                simwood.account, simwood.username
+            );
+            let context = make_simwood_context(simwood);
+            Box::new(simwood_client.get_available_numbers(
+                simwood.account.clone(),
+                "standard".to_string(),
+                1,
+                None,
+                &context
+            ).then({
+                let simwood = simwood.clone();
+                let simwood_client = simwood_client.clone();
+                move |result| match result {
+                Ok(GetAvailableNumbersResponse::Success(success_result)) => {
+                    match success_result[0] {
+                        models::AvailableNumber {
+                            country_code: Some(ref cc),
+                            number: Some(ref num),
+                            ..
+                        } => {
+                            let number: String = cc.to_string() + num;
+                            info!("Found available number {}", number);
 
                             // Put allocated number
-                            let result = core.run(simwood_client.put_allocated_number(AC_NUM.to_string(), directory_number.to_string()));
-                            println!("PUT ALLOCATED NUMBER: {}: {:?} (X-Span-ID: {:?})\n", directory_number, result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
+                            Box::new(simwood_client.put_allocated_number(
+                                simwood.account.clone(),
+                                number.clone(),
+                                &context
+                            ).then(move |result| match result {
+                                Ok(PutAllocatedNumberResponse::Success) => {
+                                    info!(
+                                        "Claimed available number {}",
+                                        number
+                                    );
 
-                            // Configure route
-                            let config = models::NumberConfig {
-                            options: Some(models::NumberConfigOptions {
-                                enabled: Some(true),
-                                ..models::NumberConfigOptions::new()
-                            }),
-                            routing: Some([
-                                ( "default".to_string(), vec![vec![
-                                    models::RoutingEntry {
-                                        endpoint: Some("%number@ec2-35-173-185-145.compute-1.amazonaws.com:5080".to_string()),
-                                        ..models::RoutingEntry::new()
-                                    }
-                                ]])
-                                ].iter().cloned().collect()),
-                            };
-                            let result = core.run(simwood_client.put_number_config(AC_NUM.to_string(), directory_number.to_string(), Some(config)));
-                            println!("CONFIGURE ROUTE: {}: {:?} (X-Span-ID: {:?})\n", directory_number, result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
-
+                                    // Configure route
+                                    let config = models::NumberConfig {
+                                        options: Some(
+                                            models::NumberConfigOptions {
+                                                enabled: Some(true),
+                                                ..models::NumberConfigOptions::new()
+                                            },
+                                        ),
+                                        routing: Some(
+                                            [(
+                                                "default".to_string(),
+                                                vec![vec![models::RoutingEntry {
+                                                    endpoint: service_sip_uri.clone(),
+                                                    ..models::RoutingEntry::new()
+                                                }]],
+                                            )]
+                                            .iter()
+                                            .cloned()
+                                            .collect(),
+                                        ),
+                                    };
+                                    Box::new(simwood_client.put_number_config(
+                                            simwood.account.clone(),
+                                            number.to_string(),
+                                            Some(config),
+                                            &context
+                                        ).then(move |result| {match result {
+                                            Ok(PutNumberConfigResponse::Success(_)) => {
+                                                info!("Set routing configuration for number {} to {}", number, service_sip_uri.unwrap_or("<none>".to_string()));
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Synchronized), numbers: Some(vec![number])})
+                                            },
+                                            Ok(PutNumberConfigResponse::NumberNotAllocated) => {
+                                                warn!("Claimed number {} no longer allocated when setting routing configuration", number);
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Failed), numbers: Some(vec![number.clone()])})
+                                            },
+                                            Err(error) => {
+                                                warn!("Failed to set routing configuration for number {}: {}", number, error.0);
+                                                future::ok(PstnConnectionStatus{status: Some(Status::Failed), numbers: Some(vec![number.clone()])})
+                                            }
+                                        }
+                                        })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                                }
+                                Ok(
+                                    PutAllocatedNumberResponse::NumberNotAvailable,
+                                ) => {
+                                    // TODO: Handle this race condition
+                                    warn!("Available number {} not available after all", number);
+                                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                                }
+                                Err(error) => {
+                                    warn!("Failed to claim available number: {}", error.0);
+                                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                                },
+                            })) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                         },
-                        // Get available numbers: FAILURE
-                        _ => {
-                            println!("Error retrieving available numbers\n");
-                        },
+                        _ => { warn!(
+                            "Failed to parse available number - got {:?}",
+                            success_result[0]);
+                            Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+                        }
                     }
                 },
-                WatchEvent::Deleted(pstn) => {
-
-                    println!("DELETED PSTN CONNECTION {} FOR ACCOUNT {}\n", pstn.metadata.name, pstn.spec.provider.simwood.account);
-                    println!("***Directory number: {}***\n", directory_number);
-                    
-                    // Delete allocated number
-                    let result = core.run(simwood_client.delete_allocated_number(AC_NUM.to_string(), directory_number.to_string()));
-                    println!("DELETE ALLOCATED NUMBER: {}: {:?} (X-Span-ID: {:?})\n", directory_number.to_string(), result, (simwood_client.context() as &Has<XSpanIdString>).get().clone());
-                },
-                event => {
-                    println!("Another event occurred: {:?}", event);
+                Err(error) => {
+                    warn!("Failed to retrieve available number: {}", error.0);
+                    Box::new(future::ok(PstnConnectionStatus{status: Some(Status::Failed), ..PstnConnectionStatus::default()})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
                 }
-            }
+            }})) as Box<dyn Future<Item=PstnConnectionStatus, Error=()> + 'static>
+        }
+        _ => {
+            warn!(
+                "PSTN connection {} added with unknown provider",
+                pstn.metadata.name
+            );
+            Box::new(future::ok(PstnConnectionStatus {
+                status: Some(Status::UnknownProvider),
+                ..PstnConnectionStatus::default()
+            })) as Box<dyn Future<Item = PstnConnectionStatus, Error = ()> + 'static>
+        }
+    }
+}
+
+fn handle_pstn_connection_delete(
+    pstn: PstnConnection,
+    simwood_client: &simwood_rs::Client<hyper::client::FutureResponse>,
+) -> Box<dyn Future<Item = (), Error = ()> + 'static> {
+    match pstn.spec.provider {
+        Provider {
+            simwood: Some(ref simwood),
+        } => {
+            info!(
+                "Using Simwood account {} with username {}",
+                simwood.account, simwood.username
+            );
+            let context = make_simwood_context(simwood);
+
+            // Delete allocated number
+            let delete_futures: Vec<_> = pstn
+                .status
+                .and_then(|s| s.numbers)
+                .unwrap_or_else(|| Vec::new())
+                .iter()
+                .cloned()
+                .map({
+                    let simwood = simwood.clone();
+                    let simwood_client = simwood_client.clone();
+                    let context = context.clone();
+                    move |number| {
+                        simwood_client
+                            .delete_allocated_number(
+                                simwood.account.clone(),
+                                number.clone(),
+                                &context,
+                            )
+                            .then(move |result| {
+                                match result {
+                                    Ok(DeleteAllocatedNumberResponse::Success) => {
+                                        info!("Deleted number {}", number)
+                                    }
+                                    Ok(DeleteAllocatedNumberResponse::NumberNotAllocated) => {
+                                        info!("Failed to delete number {} - not allocated", number)
+                                    }
+                                    Err(error) => {
+                                        warn!("Failed to delete number {}: {}", number, error.0)
+                                    }
+                                }
+                                future::ok(())
+                            })
+                    }
+                })
+                .collect();
+            Box::new(
+                future::join_all(delete_futures).then(move |_: Result<Vec<()>, ()>| future::ok(())),
+            ) as Box<dyn Future<Item = (), Error = ()> + 'static>
+        }
+        _ => {
+            warn!(
+                "PSTN connection {} deleted with unknown provider",
+                pstn.metadata.name
+            );
+            Box::new(future::ok(())) as Box<dyn Future<Item = (), Error = ()> + 'static>
         }
     }
 }
